@@ -483,6 +483,11 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
     shm_unlink(full_path.c_str());
     return kFileMappingHandleInvalid;
   }
+  // All views are mapped from the descriptor, so the name isn't needed past
+  // this point. Unlinking now means the backing memory is freed whenever the
+  // process ends - the hard exit at shutdown, crashes and kills never reach
+  // CloseFileMappingHandle and used to leave multi-GB files in /dev/shm.
+  shm_unlink(full_path.c_str());
   return static_cast<FileMappingHandle>(ret);
 #endif
 }
