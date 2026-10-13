@@ -14,6 +14,7 @@
 #include <atomic>
 #include <bitset>
 #include <memory>
+#include <mutex>
 #include <utility>
 #include <vector>
 
@@ -82,6 +83,11 @@ class InputSystem : public system::IInputSystem {
   X_INPUT_VIBRATION ModifyVibrationLevel(const X_INPUT_VIBRATION* vibration) const;
 
   rex::ui::Window* window_ = nullptr;
+
+  // Guest threads poll input concurrently, and RefreshDevices rebuilds the
+  // device lists below, so every entry point that touches them takes this.
+  // Recursive because GetState goes through GetStateForUI.
+  std::recursive_mutex mutex_;
 
   std::vector<std::unique_ptr<InputDriver>> drivers_;
 
