@@ -19,8 +19,13 @@
 #include <fmt/format.h>
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/math.h>
+
+REXCVAR_DEFINE_BOOL(spirv_cube_lod_from_gradients, true, "GPU/Shader",
+                    "Sample cube maps with an LOD calculated from the gradients in the shader "
+                    "instead of passing the gradients to the sampler (avoids GPU hangs on Nvidia)");
 
 namespace rex::graphics {
 
@@ -578,6 +583,15 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
     // Whether to use gradients (implicit or explicit) for LOD calculation.
     bool use_computed_lod = instr.attributes.use_computed_lod &&
                             (is_pixel_shader() || instr.attributes.use_register_gradients);
+    // Sampling a cube map with explicit gradients (Grad) can hang Nvidia GPUs
+    // (Xid 109 CTX SWITCH TIMEOUT) when the fetch is reached in divergent
+    // control flow, which the main loop and switch emulating guest control
+    // flow make common - for instance, after a predicated jump over a shadow
+    // map PCF block in the player shaders of 54540830 at 2x resolution scale.
+    // Calculate the LOD from the same gradients and sample with it instead.
+    bool cube_lod_from_gradients = instr.dimension == xenos::FetchOpDimension::kCube &&
+                                   use_computed_lod &&
+                                   REXCVAR_GET(spirv_cube_lod_from_gradients);
     if (instr.opcode == ucode::FetchOpcode::kGetTextureComputedLod &&
         (!use_computed_lod || instr.attributes.use_register_gradients)) {
       assert_always();
@@ -815,6 +829,10 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           }
           // The size is not needed for face ID offset.
           size_needed_components &= 0b0011;
+          if (cube_lod_from_gradients) {
+            // The width for calculating the LOD from the gradients.
+            size_needed_components |= 0b0001;
+          }
           break;
       }
     }
@@ -1454,6 +1472,7 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         // k2D.
         // 3D vectors for k3DOrStacked, kCube.
         spv::Id gradients_h = spv::NoResult, gradients_v = spv::NoResult;
+        spv::Id cube_lod = spv::NoResult;
         if (use_computed_lod) {
           // TODO(Triang3l): Gradient exponent adjustment is currently not done
           // in getCompTexLOD, so not doing it here too for now. Apply the
@@ -1609,6 +1628,28 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
                   spv::OpVectorTimesScalar, type_float3_, gradients_h, lod_gradient_scale);
               gradients_v = builder_->createNoContractionBinOp(
                   spv::OpVectorTimesScalar, type_float3_, gradients_v, lod_gradient_scale);
+              if (cube_lod_from_gradients) {
+                // The coordinates are on the face (the major axis is +-1), which
+                // is 2 units wide for the width in texels.
+                assert_true(size[0] != spv::NoResult);
+                spv::Id gradient_length_max = builder_->createBinBuiltinCall(
+                    type_float_, ext_inst_glsl_std_450_, GLSLstd450NMax,
+                    builder_->createUnaryBuiltinCall(type_float_, ext_inst_glsl_std_450_,
+                                                     GLSLstd450Length, gradients_h),
+                    builder_->createUnaryBuiltinCall(type_float_, ext_inst_glsl_std_450_,
+                                                     GLSLstd450Length, gradients_v));
+                cube_lod = builder_->createUnaryBuiltinCall(
+                    type_float_, ext_inst_glsl_std_450_, GLSLstd450Log2,
+                    builder_->createNoContractionBinOp(
+                        spv::OpFMul, type_float_, gradient_length_max,
+                        builder_->createNoContractionBinOp(spv::OpFMul, type_float_, size[0],
+                                                           builder_->makeFloatConstant(0.5f))));
+                // -Infinity for zero gradients, NaN for undefined ones (NMax
+                // returns the non-NaN operand) - the sampler clamps the rest.
+                cube_lod = builder_->createBinBuiltinCall(type_float_, ext_inst_glsl_std_450_,
+                                                          GLSLstd450NMax, cube_lod,
+                                                          builder_->makeFloatConstant(-16.0f));
+              }
             } break;
           }
         }
@@ -1837,7 +1878,10 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           sample_result_signed =
               if_data_is_3d.createMergePhi(sample_result_signed_3d, sample_result_signed_stacked);
         } else {
-          if (use_computed_lod) {
+          if (cube_lod != spv::NoResult) {
+            image_operands_mask = spv::ImageOperandsLodMask;
+            texture_parameters.lod = cube_lod;
+          } else if (use_computed_lod) {
             texture_parameters.gradX = gradients_h;
             texture_parameters.gradY = gradients_v;
           }
