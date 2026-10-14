@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <climits>
 #include <cmath>
 #include <condition_variable>
@@ -358,6 +359,12 @@ class Presenter {
   bool RefreshGuestOutput(uint32_t frontbuffer_width, uint32_t frontbuffer_height,
                           uint32_t display_aspect_ratio_x, uint32_t display_aspect_ratio_y,
                           std::function<bool(GuestOutputRefreshContext& context)> refresher);
+  // Called on each guest vblank with the tick's ideal time. With present_pace_to_guest_vblank,
+  // refreshed guest output is presented at the next vblank instead of immediately, like the
+  // console's display flip.
+  void OnGuestVblank(std::chrono::steady_clock::time_point vblank_time);
+  // Stops the pacing thread; call after guest vblanks and refreshes have stopped.
+  void StopGuestOutputPacing();
   // The implementation must be callable from any thread, including from
   // multiple at the same time, and it should acquire the latest guest output
   // image via ConsumeGuestOutput.
@@ -845,6 +852,10 @@ class Presenter {
   // has been successfully sent to the OS presentation at least.
   PaintResult PaintAndPresent(bool execute_ui_drawers);
 
+  // Paints the latest guest output, or requests a UI thread paint, per the current paint mode.
+  void PresentLatestGuestOutput();
+  void GuestOutputPacingThread();
+
   void HandleUIDrawersChangeFromUIThread(bool drawers_were_empty);
 
   bool AreUITicksNeededFromUIThread() const {
@@ -1051,6 +1062,21 @@ class Presenter {
 
   std::thread dxgi_ui_tick_thread_;
 #endif  // XE_PLATFORM
+
+  std::mutex guest_output_pacing_mutex_;
+  std::condition_variable guest_output_pacing_condition_;
+  std::thread guest_output_pacing_thread_;
+  uint64_t guest_output_pacing_vblank_count_ = 0;
+  std::chrono::steady_clock::time_point guest_output_pacing_vblank_time_{};
+  std::chrono::steady_clock::duration guest_output_pacing_vblank_period_{};
+  bool guest_output_pacing_shutdown_ = false;
+  std::atomic<bool> guest_output_paced_frame_pending_{false};
+  // steady_clock ticks when the pending frame was submitted, for the pacing log.
+  std::atomic<int64_t> guest_output_paced_frame_arrival_{0};
+  std::atomic<uint32_t> guest_output_paced_frames_replaced_{0};
+  std::atomic<uint32_t> host_presents_{0};
+  // Window-thread paints by trigger: forced by the window, UI drawers, requested, outdated.
+  std::array<std::atomic<uint32_t>, 4> ui_paints_{};
 };
 
 }  // namespace ui

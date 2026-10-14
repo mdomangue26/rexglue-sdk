@@ -1000,6 +1000,11 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
 
   bool matched = false;
   do {
+    uint64_t wake_epoch;
+    {
+      std::lock_guard<std::mutex> lock(wait_wake_mutex_);
+      wake_epoch = wait_wake_epoch_;
+    }
     uint32_t value = 0;
     if (is_memory) {
       value =
@@ -1046,7 +1051,11 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
           // User wants it fast and dangerous.
           rex::thread::MaybeYield();
         } else {
-          rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
+          // Sleep until the next poll, or until something that may have
+          // satisfied the wait happened (WakeWaits, e.g. after a vblank).
+          std::unique_lock<std::mutex> lock(wait_wake_mutex_);
+          wait_wake_cv_.wait_for(lock, std::chrono::milliseconds(wait / 0x100),
+                                 [&] { return wait_wake_epoch_ != wake_epoch; });
         }
         rex::thread::SyncMemory();
         ReturnFromWait();

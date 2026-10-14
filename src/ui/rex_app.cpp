@@ -466,10 +466,18 @@ void ReXApp::LaunchModule() {
     if (achievement_notification_ && achievement_notification_listener_ == 0 && runtime_ &&
         runtime_->kernel_state()) {
       std::weak_ptr<ui::AchievementNotificationDialog> notification = achievement_notification_;
+      auto* context = &app_context();
+      auto* drawer = imgui_drawer_.get();
       achievement_notification_listener_ = achievements().RegisterNotificationCallback(
-          [notification](const rex::system::AchievementEvent& event) {
+          [notification, context, drawer](const rex::system::AchievementEvent& event) {
             if (auto dialog = notification.lock()) {
               dialog->Push(event);
+              // The toast registers itself only while it has something to show.
+              context->CallInUIThread([notification, drawer]() {
+                if (auto shown = notification.lock()) {
+                  drawer->AddDialog(shown.get());
+                }
+              });
             }
           });
     }

@@ -12,6 +12,7 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -86,6 +87,16 @@ class CommandProcessor {
 
   uint32_t counter() const { return counter_; }
   void increment_counter() { counter_++; }
+
+  // Wakes a WAIT_REG_MEM that is sleeping between polls, e.g. after the vblank
+  // interrupt handler has released the flip mailbox.
+  void WakeWaits() {
+    {
+      std::lock_guard<std::mutex> lock(wait_wake_mutex_);
+      ++wait_wake_epoch_;
+    }
+    wait_wake_cv_.notify_all();
+  }
 
   Shader* active_vertex_shader() const { return active_vertex_shader_; }
   Shader* active_pixel_shader() const { return active_pixel_shader_; }
@@ -236,6 +247,10 @@ class CommandProcessor {
   RegisterFile* register_file_ = nullptr;
 
   std::atomic<bool> worker_running_;
+
+  std::mutex wait_wake_mutex_;
+  std::condition_variable wait_wake_cv_;
+  uint64_t wait_wake_epoch_ = 0;  // guarded by wait_wake_mutex_
   system::object_ref<system::XHostThread> worker_thread_;
 
   std::queue<std::function<void()>> pending_fns_;

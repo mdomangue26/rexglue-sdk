@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -159,14 +160,29 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
         uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
         while (vsync_worker_running_) {
-          uint64_t current_time = chrono::Clock::QueryGuestTickCount();
           uint64_t interval_ticks =
               REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
+          uint64_t deadline = last_frame_time + interval_ticks;
+          // Wake on the tick with a high-resolution timer instead of polling with Sleep(1).
+          // Do not spin: this thread can share a core with a pinned guest thread.
+          int64_t remaining_us = int64_t(deadline - chrono::Clock::QueryGuestTickCount()) *
+                                 1000000 / int64_t(guest_tick_frequency);
+          if (remaining_us > 0) {
+            rex::thread::PreciseSleep(std::chrono::microseconds(remaining_us));
+          }
+          if (presenter_) {
+            // Report when the tick was due, not when this thread woke up.
+            int64_t late_ticks = int64_t(chrono::Clock::QueryGuestTickCount() - deadline);
+            presenter_->OnGuestVblank(
+                std::chrono::steady_clock::now() -
+                std::chrono::nanoseconds(std::max<int64_t>(late_ticks, 0) * 1000000000 /
+                                         int64_t(guest_tick_frequency)));
+          }
+          uint64_t current_time = chrono::Clock::QueryGuestTickCount();
           while (current_time - last_frame_time >= interval_ticks) {
             MarkVblank();
             last_frame_time += interval_ticks;
           }
-          rex::thread::Sleep(std::chrono::milliseconds(1));
         }
         return 0;
       }));
@@ -188,6 +204,9 @@ void GraphicsSystem::Shutdown() {
     vsync_worker_running_ = false;
     vsync_worker_thread_->Wait(0, 0, 0, nullptr);
     vsync_worker_thread_.reset();
+  }
+  if (presenter_) {
+    presenter_->StopGuestOutputPacing();
   }
 
   if (presenter_) {
@@ -316,6 +335,8 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
                                          rex::countof(args));
 }
 
+
+
 void GraphicsSystem::MarkVblank() {
   // TODO: Enable profiling once ported
   // SCOPE_profile_cpu_f("gpu");
@@ -329,6 +350,13 @@ void GraphicsSystem::MarkVblank() {
   //     something wrong and the CP will block waiting for code that
   //     needs to be run in the interrupt.
   DispatchInterruptCallback(0, 2);
+
+  // The interrupt handler typically releases the flip the command processor is
+  // waiting for (WAIT_REG_MEM on the vsync mailbox): wake it now instead of at
+  // its next 1 ms poll.
+  if (command_processor_) {
+    command_processor_->WakeWaits();
+  }
 }
 
 void GraphicsSystem::ClearCaches() {
