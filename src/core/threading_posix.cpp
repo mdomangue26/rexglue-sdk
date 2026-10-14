@@ -267,6 +267,26 @@ static sem_t* RexCreateAnonymousSemaphore() {
 }
 #endif  // __APPLE__
 
+// WaitMultiple blocks on this instead of polling its handles: every
+// condition signal bumps the epoch (only while a multi-waiter exists), which
+// wakes multi-waiters to re-check their handles. Lock order: a condition's
+// mutex_ may be held while taking g_multi_wait_mutex, never the reverse.
+std::mutex g_multi_wait_mutex;
+std::condition_variable g_multi_wait_cv;
+uint64_t g_multi_wait_epoch = 0;  // guarded by g_multi_wait_mutex
+std::atomic<uint32_t> g_multi_waiters{0};
+
+void NotifyMultiWaiters() {
+  if (g_multi_waiters.load(std::memory_order_seq_cst) == 0) {
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(g_multi_wait_mutex);
+    ++g_multi_wait_epoch;
+  }
+  g_multi_wait_cv.notify_all();
+}
+
 class PosixConditionBase {
  public:
   PosixConditionBase() {
@@ -335,7 +355,17 @@ class PosixConditionBase {
                         ? std::chrono::steady_clock::time_point::max()
                         : start_time + timeout;
 
+    g_multi_waiters.fetch_add(1, std::memory_order_seq_cst);
+    struct WaiterGuard {
+      ~WaiterGuard() { g_multi_waiters.fetch_sub(1, std::memory_order_seq_cst); }
+    } waiter_guard;
+
     while (true) {
+      uint64_t epoch;
+      {
+        std::lock_guard<std::mutex> lock(g_multi_wait_mutex);
+        epoch = g_multi_wait_epoch;
+      }
       size_t first_signaled = std::numeric_limits<size_t>::max();
       bool condition_met = false;
       bool all_locked = true;
@@ -411,12 +441,18 @@ class PosixConditionBase {
         return std::make_pair<WaitResult, size_t>(WaitResult::kTimeout, 0);
       }
 
-      if (timeout == std::chrono::milliseconds::max()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      } else {
-        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - now);
-        auto sleep_time = std::min(remaining, std::chrono::milliseconds(1));
-        std::this_thread::sleep_for(sleep_time);
+      // Block until any condition is signaled (or the timeout). This used to
+      // sleep min(remaining, 1 ms) with remaining truncated to whole
+      // milliseconds - 0 inside the 1 ms alertable slices - so every
+      // multi-object wait spun a core.
+      {
+        std::unique_lock<std::mutex> lock(g_multi_wait_mutex);
+        auto changed = [&] { return g_multi_wait_epoch != epoch; };
+        if (end_time == std::chrono::steady_clock::time_point::max()) {
+          g_multi_wait_cv.wait(lock, changed);
+        } else {
+          g_multi_wait_cv.wait_until(lock, end_time, changed);
+        }
       }
     }
   }
@@ -450,6 +486,7 @@ class PosixCondition<Event> : public PosixConditionBase {
     auto lock = std::unique_lock<std::mutex>(mutex_);
     signal_ = true;
     cond_.notify_all();
+    NotifyMultiWaiters();
     return true;
   }
 
@@ -487,6 +524,7 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
     }
     count_ += release_count;
     cond_.notify_all();
+    NotifyMultiWaiters();
     return true;
   }
 
@@ -495,6 +533,7 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
   inline void post_execution() override {
     count_--;
     cond_.notify_all();
+    NotifyMultiWaiters();
   }
   uint32_t count_;
   const uint32_t maximum_count_;
@@ -519,6 +558,7 @@ class PosixCondition<Mutant> : public PosixConditionBase {
       // Free to be acquired by another thread
       if (count_ == 0) {
         cond_.notify_all();
+        NotifyMultiWaiters();
       }
       return true;
     }
@@ -551,6 +591,7 @@ class PosixCondition<Timer> : public PosixConditionBase {
     std::lock_guard<std::mutex> lock(mutex_);
     signal_ = true;
     cond_.notify_all();
+    NotifyMultiWaiters();
     return true;
   }
 
@@ -737,7 +778,8 @@ class PosixCondition<Thread> : public PosixConditionBase {
         pthread_setname_np(std::string(name).c_str());
       }
 #else
-      pthread_setname_np(thread_, std::string(name).c_str());
+      // Linux limits names to 15 characters and rejects longer ones outright.
+      pthread_setname_np(thread_, std::string(name).substr(0, 15).c_str());
 #endif
 #if REX_PLATFORM_ANDROID
       SetAndroidPreApi26Name(name);
@@ -979,6 +1021,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
       exit_code_ = exit_code;
       signaled_ = true;
       cond_.notify_all();
+      NotifyMultiWaiters();
     }
     if (is_current_thread) {
       pthread_exit(reinterpret_cast<void*>(exit_code));
@@ -1449,6 +1492,7 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
     thread->handle_.exit_code_ = 0;
     thread->handle_.signaled_ = true;
     thread->handle_.cond_.notify_all();
+    NotifyMultiWaiters();
   }
 
   current_thread_ = nullptr;
@@ -1512,7 +1556,7 @@ void set_current_thread_name(const std::string_view name) {
 #if defined(__APPLE__)
   pthread_setname_np(std::string(name).c_str());
 #else
-  pthread_setname_np(pthread_self(), std::string(name).c_str());
+  pthread_setname_np(pthread_self(), std::string(name).substr(0, 15).c_str());
 #endif
 #if REX_PLATFORM_ANDROID
   if (!android_pthread_getname_np_ && current_thread_) {
