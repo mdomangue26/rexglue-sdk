@@ -12,6 +12,12 @@
 #include <rex/logging.h>
 #include <rex/ui/renderdoc_api.h>
 
+#if REX_PLATFORM_WIN32
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
+
 namespace rex {
 namespace ui {
 
@@ -25,9 +31,22 @@ std::unique_ptr<RenderDocAPI> RenderDocAPI::CreateIfConnected() {
 
   pRENDERDOC_GetAPI get_api = nullptr;
 
-  // Try to load the RenderDoc library. If RenderDoc is attached, the library
-  // should already be loaded into the process and this will increment the
-  // reference count. If not attached, the load will fail and we return nullptr.
+  // Only use RenderDoc if it is already in the process (launched from or
+  // injected by RenderDoc). A plain load would pull in an installed copy
+  // (SteamOS ships librenderdoc.so), which then hooks Vulkan, captures and
+  // draws its overlay in every run.
+#if REX_PLATFORM_WIN32
+  if (!GetModuleHandleA(platform::lib_names::kRenderDoc)) {
+    return nullptr;
+  }
+#else
+  if (void* loaded = dlopen(platform::lib_names::kRenderDoc, RTLD_NOW | RTLD_NOLOAD)) {
+    dlclose(loaded);
+  } else {
+    return nullptr;
+  }
+#endif
+  // Already loaded: this only takes another reference.
   if (!renderdoc_api->library_.Load(platform::lib_names::kRenderDoc)) {
     return nullptr;
   }
