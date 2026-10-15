@@ -402,23 +402,31 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
     }
   }
   if (!range) {
-    // Recheck if the pages are still protected (race condition - another thread
-    // clears the watch we just hit).
-    // Do this under the lock so we don't introduce another race condition.
+    // Not MMIO, so either a write watch or an actual access violation.
+    //
+    // Try the callback first: for a watched page it triggers the watch, and
+    // for a page another thread has already unwatched it restores access from
+    // the guest's own protection records. Only if it can't handle the fault,
+    // recheck the host protection in case another thread changed it in the
+    // meantime. On Linux QueryProtect parses /proc/self/maps - thousands of
+    // lines once a GPU driver is loaded - and doing that first, under the
+    // process-wide global lock, on every write-watch fault made the GPU
+    // command thread and guest threads queue behind it.
+    if (access_violation_callback_) {
+      auto lock = global_critical_region_.Acquire();
+      if (access_violation_callback_(std::move(lock), access_violation_callback_context_,
+                                     fault_host_address, is_write)) {
+        return true;
+      }
+    }
     auto lock = global_critical_region_.Acquire();
     memory::PageAccess cur_access;
     size_t page_length = memory::page_size();
     memory::QueryProtect(fault_host_address, page_length, cur_access);
     if (cur_access != memory::PageAccess::kNoAccess &&
         (!is_write || cur_access != memory::PageAccess::kReadOnly)) {
-      // Another thread has cleared this watch. Abort.
+      // Another thread has changed the protection. Retry the access.
       return true;
-    }
-    // The address is not found within any range, so either a write watch or an
-    // actual access violation.
-    if (access_violation_callback_) {
-      return access_violation_callback_(std::move(lock), access_violation_callback_context_,
-                                        fault_host_address, is_write);
     }
     return false;
   }
