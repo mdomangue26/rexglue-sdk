@@ -79,6 +79,10 @@ class SharedMemory {
   bool RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count);
   bool RequestRange(uint32_t start, uint32_t length);
 
+  // True if every page of the range is already valid on the GPU. Reads the
+  // valid bits without global_critical_region_ (see the definition).
+  bool ArePagesValidUnlocked(uint32_t start, uint32_t length);
+
   // Marks the range and, if not exact_range, potentially its surroundings
   // (to up to the first GPU-written page, as an access violation exception
   // count optimization) as modified by the CPU, also invalidating GPU-written

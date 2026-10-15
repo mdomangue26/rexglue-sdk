@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <utility>
 
@@ -389,6 +390,18 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
     }
   }
 
+  // Common case: all valid already - no need for the global lock.
+  bool all_valid = true;
+  for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
+    if (!ArePagesValidUnlocked(range.first, range.second)) {
+      all_valid = false;
+      break;
+    }
+  }
+  if (all_valid) {
+    return true;
+  }
+
   upload_ranges_.clear();
   auto append_upload_range = [this](uint32_t page_start, uint32_t page_count) {
     if (!page_count) {
@@ -468,7 +481,48 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
   return UploadRanges(upload_ranges_);
 }
 
+// The draw path calls RequestRange for every vertex buffer and texture, and
+// nearly always everything is valid already. Checking that under
+// global_critical_region_ made the GPU command thread contend with guest
+// threads (the lock is process-wide) on every draw. A page reading as valid
+// here is as good as reading it under the lock and then unlocking: a CPU write
+// racing with this check is the same race the locked version has right after
+// it unlocks. Invalid pages fall through to the locked path, which uploads.
+bool SharedMemory::ArePagesValidUnlocked(uint32_t start, uint32_t length) {
+  uint32_t page_first = start >> page_size_log2_;
+  uint32_t page_last = (start + length - 1) >> page_size_log2_;
+  uint32_t block_first = page_first >> 6;
+  uint32_t block_last = page_last >> 6;
+  for (uint32_t i = block_first; i <= block_last; ++i) {
+    uint64_t want = ~uint64_t(0);
+    if (i == block_first) {
+      want &= ~((uint64_t(1) << (page_first & 63)) - 1);
+    }
+    if (i == block_last && (page_last & 63) != 63) {
+      want &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
+    }
+    uint64_t valid =
+        std::atomic_ref<uint64_t>(system_page_flags_valid_[i]).load(std::memory_order_acquire);
+    if ((valid & want) != want) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
+  if (!length) {
+    return true;
+  }
+  if (start > kBufferSize || (kBufferSize - start) < length) {
+    return false;
+  }
+  if (!EnsureHostGpuMemoryAllocated(start, length)) {
+    return false;
+  }
+  if (ArePagesValidUnlocked(start, length)) {
+    return true;
+  }
   std::pair<uint32_t, uint32_t> range(start, length);
   return RequestRanges(&range, 1);
 }
