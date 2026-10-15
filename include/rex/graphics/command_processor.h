@@ -12,6 +12,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstring>
 #include <functional>
@@ -251,6 +252,14 @@ class CommandProcessor {
   std::mutex wait_wake_mutex_;
   std::condition_variable wait_wake_cv_;
   uint64_t wait_wake_epoch_ = 0;  // guarded by wait_wake_mutex_
+
+  // cp_frame_stats: per frame (XE_SWAP to XE_SWAP), time not spent waiting
+  // (WAIT_REG_MEM sleeps, empty ring). Worker thread only.
+  std::chrono::steady_clock::time_point frame_stats_last_swap_{};
+  std::chrono::steady_clock::duration frame_stats_waited_{};
+  std::chrono::steady_clock::time_point frame_stats_window_start_{};
+  double frame_stats_sum_ms_ = 0, frame_stats_max_ms_ = 0;
+  uint32_t frame_stats_frames_ = 0;
   system::object_ref<system::XHostThread> worker_thread_;
 
   std::queue<std::function<void()>> pending_fns_;
@@ -291,6 +300,9 @@ class CommandProcessor {
   // Set by backend command processors to their legacy memexport readback cvar
   // name (for explicit-override compatibility).
   const char* legacy_readback_memexport_cvar_name_ = nullptr;
+  // HasNonDefaultValue(legacy_readback_memexport_cvar_name_), refreshed every
+  // XE_SWAP: a by-name cvar lookup on every draw was ~5% of the CP thread.
+  mutable int8_t legacy_readback_memexport_overridden_ = -1;
 
  private:
   reg::DC_LUT_30_COLOR gamma_ramp_256_entry_table_[256] = {};

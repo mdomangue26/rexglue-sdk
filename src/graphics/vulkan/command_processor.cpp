@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <bit>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -6357,6 +6358,26 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
   }
 }
 
+// Packs the float constants used by a shader (bitmap of vec4s) into a uniform
+// buffer. Copies each run of consecutive used constants at once: with dynamic
+// constant addressing (skinned meshes) all 256 are used, which was 256
+// separate bit scans and 16-byte copies per draw.
+static uint8_t* CopyFloatConstants(uint8_t* mapping, const uint64_t map[4],
+                                   const uint32_t* constants) {
+  for (uint32_t i = 0; i < 4; ++i) {
+    uint64_t entry = map[i];
+    while (entry) {
+      uint32_t first = uint32_t(std::countr_zero(entry));
+      uint32_t count = uint32_t(std::countr_one(entry >> first));
+      size_t size = sizeof(float) * 4 * count;
+      std::memcpy(mapping, constants + (i << 8) + (first << 2), size);
+      mapping += size;
+      entry = count + first >= 64 ? 0 : entry & ~((~uint64_t(0) >> (64 - count - first)));
+    }
+  }
+  return mapping;
+}
+
 bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
                                             const VulkanShader* pixel_shader) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -6456,18 +6477,8 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
         return false;
       }
       buffer_info.range = VkDeviceSize(float_constants_size);
-      for (uint32_t i = 0; i < 4; ++i) {
-        uint64_t float_constant_map_entry = current_float_constant_map_vertex_[i];
-        uint32_t float_constant_index;
-        while (rex::bit_scan_forward(float_constant_map_entry, &float_constant_index)) {
-          float_constant_map_entry &= ~(1ull << float_constant_index);
-          std::memcpy(
-              mapping,
-              &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + (i << 8) + (float_constant_index << 2)],
-              sizeof(float) * 4);
-          mapping += sizeof(float) * 4;
-        }
-      }
+      mapping = CopyFloatConstants(mapping, current_float_constant_map_vertex_,
+                                   &regs[XE_GPU_REG_SHADER_CONSTANT_000_X]);
       current_constant_buffers_up_to_date_ |= UINT32_C(1)
                                               << SpirvShaderTranslator::kConstantBufferFloatVertex;
     }
@@ -6485,18 +6496,8 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
         return false;
       }
       buffer_info.range = VkDeviceSize(float_constants_size);
-      for (uint32_t i = 0; i < 4; ++i) {
-        uint64_t float_constant_map_entry = current_float_constant_map_pixel_[i];
-        uint32_t float_constant_index;
-        while (rex::bit_scan_forward(float_constant_map_entry, &float_constant_index)) {
-          float_constant_map_entry &= ~(1ull << float_constant_index);
-          std::memcpy(
-              mapping,
-              &regs[XE_GPU_REG_SHADER_CONSTANT_256_X + (i << 8) + (float_constant_index << 2)],
-              sizeof(float) * 4);
-          mapping += sizeof(float) * 4;
-        }
-      }
+      mapping = CopyFloatConstants(mapping, current_float_constant_map_pixel_,
+                                   &regs[XE_GPU_REG_SHADER_CONSTANT_256_X]);
       current_constant_buffers_up_to_date_ |= UINT32_C(1)
                                               << SpirvShaderTranslator::kConstantBufferFloatPixel;
     }

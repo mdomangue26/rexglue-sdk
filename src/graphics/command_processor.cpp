@@ -80,6 +80,10 @@ REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
                     "pipelines are being prepared.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(cp_frame_stats, false, "GPU",
+                    "Log the command processor's working time per frame (XE_SWAP to XE_SWAP "
+                    "minus waits for the vblank and for new commands) every 5 seconds");
+
 namespace rex::graphics {
 
 using namespace rex::graphics::xenos;
@@ -182,8 +186,12 @@ ReadbackResolveMode CommandProcessor::GetReadbackResolveMode(
 }
 
 bool CommandProcessor::IsReadbackMemexportEnabled(bool legacy_backend_flag) const {
-  if (legacy_readback_memexport_cvar_name_ &&
-      rex::cvar::HasNonDefaultValue(legacy_readback_memexport_cvar_name_)) {
+  if (legacy_readback_memexport_overridden_ < 0) {
+    legacy_readback_memexport_overridden_ =
+        legacy_readback_memexport_cvar_name_ &&
+        rex::cvar::HasNonDefaultValue(legacy_readback_memexport_cvar_name_);
+  }
+  if (legacy_readback_memexport_overridden_) {
     return legacy_backend_flag;
   }
   return REXCVAR_GET(readback_memexport);
@@ -217,6 +225,7 @@ void CommandProcessor::WorkerThreadMain() {
       // We spin here waiting for new ones, as the overhead of waiting on our
       // event is too high.
       PrepareForWait();
+      auto idle_start = std::chrono::steady_clock::now();
       uint32_t loop_count = 0;
       do {
         // If we spin around too much, revert to a "low-power" state.
@@ -231,6 +240,7 @@ void CommandProcessor::WorkerThreadMain() {
         write_ptr_index = write_ptr_index_.load();
       } while (worker_running_ && pending_fns_.empty() &&
                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
+      frame_stats_waited_ += std::chrono::steady_clock::now() - idle_start;
       ReturnFromWait();
       if (!worker_running_ || !pending_fns_.empty()) {
         continue;
@@ -939,6 +949,31 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
                                                   uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
 
+  legacy_readback_memexport_overridden_ = -1;  // re-check the cvar once per frame
+  if (REXCVAR_GET(cp_frame_stats)) {
+    auto now = std::chrono::steady_clock::now();
+    if (frame_stats_last_swap_ != std::chrono::steady_clock::time_point{}) {
+      double ms = std::chrono::duration<double, std::milli>(now - frame_stats_last_swap_ -
+                                                            frame_stats_waited_)
+                      .count();
+      frame_stats_sum_ms_ += ms;
+      frame_stats_max_ms_ = std::max(frame_stats_max_ms_, ms);
+      ++frame_stats_frames_;
+    } else {
+      frame_stats_window_start_ = now;
+    }
+    frame_stats_last_swap_ = now;
+    frame_stats_waited_ = {};
+    if (now - frame_stats_window_start_ >= std::chrono::seconds(5) && frame_stats_frames_) {
+      REXGPU_INFO("CP frame work: {:.2f} ms avg, {:.2f} ms max over {} frames",
+                  frame_stats_sum_ms_ / frame_stats_frames_, frame_stats_max_ms_,
+                  frame_stats_frames_);
+      frame_stats_sum_ms_ = frame_stats_max_ms_ = 0;
+      frame_stats_frames_ = 0;
+      frame_stats_window_start_ = now;
+    }
+  }
+
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
   {
     static uint64_t last_frame_tick = 0;
@@ -1053,9 +1088,13 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         } else {
           // Sleep until the next poll, or until something that may have
           // satisfied the wait happened (WakeWaits, e.g. after a vblank).
-          std::unique_lock<std::mutex> lock(wait_wake_mutex_);
-          wait_wake_cv_.wait_for(lock, std::chrono::milliseconds(wait / 0x100),
-                                 [&] { return wait_wake_epoch_ != wake_epoch; });
+          auto wait_start = std::chrono::steady_clock::now();
+          {
+            std::unique_lock<std::mutex> lock(wait_wake_mutex_);
+            wait_wake_cv_.wait_for(lock, std::chrono::milliseconds(wait / 0x100),
+                                   [&] { return wait_wake_epoch_ != wake_epoch; });
+          }
+          frame_stats_waited_ += std::chrono::steady_clock::now() - wait_start;
         }
         rex::thread::SyncMemory();
         ReturnFromWait();
