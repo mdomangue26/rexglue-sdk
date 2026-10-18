@@ -2290,6 +2290,11 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     return;
   }
 
+  if (!REXCVAR_GET(present_guest_swaps)) {
+    EndSubmission(true);
+    return;
+  }
+
   bool skip_present_due_async_placeholder = REXCVAR_GET(async_shader_compilation) &&
                                             REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
                                             frame_used_async_placeholder_pipeline_;

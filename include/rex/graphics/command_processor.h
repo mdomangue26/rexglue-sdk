@@ -138,6 +138,13 @@ class CommandProcessor {
   void Pause();
   void Resume();
 
+  // The gamma ramps the guest has set (DC_LUT_*); public for apps that present
+  // frames rendered by their own renderer (see present_guest_swaps).
+  const reg::DC_LUT_30_COLOR* gamma_ramp_256_entry_table() const {
+    return gamma_ramp_256_entry_table_;
+  }
+  const reg::DC_LUT_PWL_DATA* gamma_ramp_pwl_rgb() const { return gamma_ramp_pwl_rgb_[0]; }
+
   bool Save(::rex::stream::ByteStream* stream);
   bool Restore(::rex::stream::ByteStream* stream);
 
@@ -170,10 +177,6 @@ class CommandProcessor {
   void WriteLoopRangeFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers);
   void WriteREGISTERSRangeFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers);
 
-  const reg::DC_LUT_30_COLOR* gamma_ramp_256_entry_table() const {
-    return gamma_ramp_256_entry_table_;
-  }
-  const reg::DC_LUT_PWL_DATA* gamma_ramp_pwl_rgb() const { return gamma_ramp_pwl_rgb_[0]; }
   virtual void OnGammaRamp256EntryTableValueWritten() {}
   virtual void OnGammaRampPWLValueWritten() {}
 

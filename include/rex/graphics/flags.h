@@ -18,6 +18,8 @@ REXCVAR_DECLARE(bool, vsync);
 REXCVAR_DECLARE(bool, clear_memory_page_state);
 REXCVAR_DECLARE(bool, half_pixel_offset);
 REXCVAR_DECLARE(bool, async_shader_compilation);
+REXCVAR_DECLARE(bool, present_guest_swaps);
+REXCVAR_DECLARE(bool, gpu_skip_draws);
 
 // GPU Resolution / Readback / Queries
 REXCVAR_DECLARE(int32_t, resolution_scale);

@@ -45,6 +45,16 @@ REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
 REXCVAR_DEFINE_BOOL(occlusion_query_enable, true, "GPU", "Enable host occlusion query handling")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(present_guest_swaps, true, "GPU",
+                    "Present the frames the guest swaps. Off when the app renders and presents "
+                    "frames itself (the swap still ends the command processor's frame)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(gpu_skip_draws, false, "GPU",
+                    "Process the command stream without drawing or resolving (for apps that "
+                    "render the frames themselves; synchronization packets still run)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_STRING(readback_resolve, "none", "GPU",
                       "Controls CPU readback of render-to-texture resolve results.\n"
                       " none: Disable readback (default)\n"
@@ -1427,7 +1437,8 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
 
   if (draw_succeeded) {
     auto viz_query = register_file_->Get<reg::PA_SC_VIZ_QUERY>();
-    if (!(viz_query.viz_query_ena && viz_query.kill_pix_post_hi_z)) {
+    if (!(viz_query.viz_query_ena && viz_query.kill_pix_post_hi_z) &&
+        !REXCVAR_GET(gpu_skip_draws)) {
       // TODO(Triang3l): Don't drop the draw call completely if the vertex
       // shader has memexport.
       // TODO(Triang3l || JoelLinn): Handle this properly in the render

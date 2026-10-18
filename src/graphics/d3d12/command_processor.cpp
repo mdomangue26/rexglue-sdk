@@ -1911,6 +1911,11 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     return;
   }
 
+  if (!REXCVAR_GET(present_guest_swaps)) {
+    EndSubmission(true);
+    return;
+  }
+
   // Obtain the actual swap source texture size (resolution-scaled if it's a
   // resolve destination, or not otherwise).
   D3D12_SHADER_RESOURCE_VIEW_DESC swap_texture_srv_desc;
