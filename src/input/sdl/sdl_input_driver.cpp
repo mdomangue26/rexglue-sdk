@@ -13,6 +13,7 @@
 #include <array>
 #include <cctype>
 #include <filesystem>
+#include <optional>
 #include <string_view>
 
 #include <rex/assert.h>
@@ -26,9 +27,105 @@
 REXCVAR_DEFINE_STRING(hid_mappings_file, "gamecontrollerdb.txt", "Input",
                       "Path to SDL gamecontroller mappings file");
 
+// Controller button remapping: the game button (A, B, X, Y, LB, RB, LT, RT,
+// Back, Start, LS, RS, Up, Down, Left, Right, or None) each physical button or
+// trigger presses. Applied as the game reads the state (live).
+#define REX_PADBIND(name, physical)                                             \
+  REXCVAR_DEFINE_STRING(padbind_##name, physical, "Input/Controller buttons", \
+                        "Game button the controller's " physical " presses")
+REX_PADBIND(a, "A");
+REX_PADBIND(b, "B");
+REX_PADBIND(x, "X");
+REX_PADBIND(y, "Y");
+REX_PADBIND(lb, "LB");
+REX_PADBIND(rb, "RB");
+REX_PADBIND(lt, "LT");
+REX_PADBIND(rt, "RT");
+REX_PADBIND(back, "Back");
+REX_PADBIND(start, "Start");
+REX_PADBIND(ls, "LS");
+REX_PADBIND(rs, "RS");
+REX_PADBIND(up, "Up");
+REX_PADBIND(down, "Down");
+REX_PADBIND(left, "Left");
+REX_PADBIND(right, "Right");
+#undef REX_PADBIND
+
 namespace rex::input::sdl {
 
 namespace {
+
+// padbind_*: a physical input (button mask, or trigger 1 = left, 2 = right)
+// and the game input it drives.
+struct PadInput {
+  uint16_t button;
+  int trigger;
+};
+constexpr std::pair<std::string_view, PadInput> kPadInputs[] = {
+    {"A", {X_INPUT_GAMEPAD_A, 0}},
+    {"B", {X_INPUT_GAMEPAD_B, 0}},
+    {"X", {X_INPUT_GAMEPAD_X, 0}},
+    {"Y", {X_INPUT_GAMEPAD_Y, 0}},
+    {"LB", {X_INPUT_GAMEPAD_LEFT_SHOULDER, 0}},
+    {"RB", {X_INPUT_GAMEPAD_RIGHT_SHOULDER, 0}},
+    {"LT", {0, 1}},
+    {"RT", {0, 2}},
+    {"Back", {X_INPUT_GAMEPAD_BACK, 0}},
+    {"Start", {X_INPUT_GAMEPAD_START, 0}},
+    {"LS", {X_INPUT_GAMEPAD_LEFT_THUMB, 0}},
+    {"RS", {X_INPUT_GAMEPAD_RIGHT_THUMB, 0}},
+    {"Up", {X_INPUT_GAMEPAD_DPAD_UP, 0}},
+    {"Down", {X_INPUT_GAMEPAD_DPAD_DOWN, 0}},
+    {"Left", {X_INPUT_GAMEPAD_DPAD_LEFT, 0}},
+    {"Right", {X_INPUT_GAMEPAD_DPAD_RIGHT, 0}},
+};
+
+std::optional<PadInput> ParsePadInput(std::string_view name) {
+  for (const auto& [n, input] : kPadInputs) {
+    if (n.size() != name.size()) continue;
+    bool same = true;
+    for (size_t i = 0; i < n.size() && same; ++i)
+      same = std::tolower(static_cast<unsigned char>(n[i])) ==
+             std::tolower(static_cast<unsigned char>(name[i]));
+    if (same) return input;
+  }
+  return std::nullopt;  // "None" or unknown: unbound
+}
+
+// Applies padbind_* to a pad's state (physical -> game).
+void RemapPad(X_INPUT_GAMEPAD& pad) {
+  const std::string* binds[] = {
+      &REXCVAR_GET(padbind_a),    &REXCVAR_GET(padbind_b),     &REXCVAR_GET(padbind_x),
+      &REXCVAR_GET(padbind_y),    &REXCVAR_GET(padbind_lb),    &REXCVAR_GET(padbind_rb),
+      &REXCVAR_GET(padbind_lt),   &REXCVAR_GET(padbind_rt),    &REXCVAR_GET(padbind_back),
+      &REXCVAR_GET(padbind_start), &REXCVAR_GET(padbind_ls),   &REXCVAR_GET(padbind_rs),
+      &REXCVAR_GET(padbind_up),   &REXCVAR_GET(padbind_down),  &REXCVAR_GET(padbind_left),
+      &REXCVAR_GET(padbind_right)};
+  bool identity = true;
+  for (size_t i = 0; i < std::size(kPadInputs) && identity; ++i)
+    identity = *binds[i] == kPadInputs[i].first;
+  if (identity) return;
+  constexpr uint8_t kTriggerThreshold = 30;  // XINPUT_GAMEPAD_TRIGGER_THRESHOLD
+  uint16_t buttons = pad.buttons & ~uint16_t(0xF3FF);  // guide and unused bits pass
+  uint8_t triggers[3] = {0, 0, 0};
+  for (size_t i = 0; i < std::size(kPadInputs); ++i) {
+    const PadInput& from = kPadInputs[i].second;
+    const uint8_t value = from.trigger == 1   ? pad.left_trigger
+                          : from.trigger == 2 ? pad.right_trigger
+                          : (pad.buttons & from.button) ? 255
+                                                        : 0;
+    const auto to = ParsePadInput(*binds[i]);
+    if (!to || !value) continue;
+    if (to->trigger) {
+      triggers[to->trigger] = std::max(triggers[to->trigger], value);
+    } else if (value > kTriggerThreshold) {
+      buttons |= to->button;
+    }
+  }
+  pad.buttons = buttons;
+  pad.left_trigger = triggers[1];
+  pad.right_trigger = triggers[2];
+}
 
 // SDL clamps to SDL_MAX_RUMBLE_DURATION_MS, which is not a public constant.
 constexpr uint32_t kRumbleDurationMs = 0xFFFF;
@@ -340,6 +437,7 @@ X_RESULT SDLInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
     controller->state_changed = false;
   }
   std::memcpy(out_state, &controller->state, sizeof(*out_state));
+  RemapPad(out_state->gamepad);
   if (!is_active) {
     // Simulate an "untouched" controller. When we become active again the
     // pressed buttons aren't lost and will be visible again.
