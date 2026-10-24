@@ -10,7 +10,6 @@
  *              See LICENSE file in the project root for full license text.
  */
 #include <rex/ui/overlay/debug_overlay.h>
-#include <rex/version.h>
 #include <imgui.h>
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
 #include <rex/perf/counter.h>
@@ -86,23 +85,6 @@ void DebugOverlayDialog::OnDraw(ImGuiIO& io) {
 #endif
   }
   ImGui::End();
-
-  // Build stamp watermark -- centered near bottom of screen
-  auto text_size = ImGui::CalcTextSize(REXGLUE_BUILD_STAMP);
-  float padding = ImGui::GetStyle().WindowPadding.x * 2.0f;
-  float bottom_offset = io.DisplaySize.y * 0.03f;
-  ImGui::SetNextWindowPos(ImVec2((io.DisplaySize.x - text_size.x - padding) * 0.5f,
-                                 io.DisplaySize.y - text_size.y - bottom_offset));
-  ImGui::SetNextWindowSize(ImVec2(0, 0));
-  ImGui::PushStyleColor(ImGuiCol_Text, imgui_drawer()->style().debug.muted_text);
-  if (ImGui::Begin("##watermark", nullptr,
-                   ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground |
-                       ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
-                       ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize)) {
-    ImGui::TextUnformatted(REXGLUE_BUILD_STAMP);
-  }
-  ImGui::End();
-  ImGui::PopStyleColor();
 }
 
 }  // namespace rex::ui
